@@ -71,9 +71,11 @@
 							<argument>${java.home}/../include</argument>
 							<argument>-I</argument>
 							<argument>${java.home}/../include/linux</argument>
+							<argument>-I</argument>
+							<argument>librgw_native</argument>
 							<argument>-o</argument>
 							<argument>target/librgw_jni.so</argument>
-							<argument>NativeRgw.c</argument>
+							<argument>librgw_native/native_rgw.c</argument>
 						</arguments>
 					</configuration>
 				</execution>
