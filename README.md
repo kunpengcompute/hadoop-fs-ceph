@@ -4,21 +4,21 @@
 Introduction
 ============
 
-Using Ceph instead of HDFS as the storage system of Hadoop, it can separates computing and storage resources, and realizes the elastic expansion of resources on demand.
+Using Ceph instead of HDFS as the storage system of Hadoop separates computing and storage resources, and realizes on-demand, elastic resource expansion.
 
 
 
-Building And Package
+Building 
 ====================
-(1) install ceph/java/maven.
+(1) Install Ceph, Java and Maven.
 
-(2) Compile under the "hadoop-fs-ceph" :
+(2) Build this module using the following command in "hadoop-fs-ceph/" folder.
 
     mvn package -DskipTests
 
-(3) get "hdfs-ceph-3.1.1.jar" under the "hadoop-fs-ceph/target/"
+(3) Get "hdfs-ceph-3.1.1.jar" from the "hadoop-fs-ceph/target/" folder.
 
-(4) get "librgw_jni.so" under the "hadoop-fs-ceph/target/"
+(4) Get "librgw_jni.so" from the "hadoop-fs-ceph/target/" folder.
 
  
 
