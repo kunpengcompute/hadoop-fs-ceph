@@ -1,0 +1,171 @@
+diff -uprN ceph-14.2.8/src/common/cohort_lru.h ceph-14.2.8/src/common/cohort_lru.h
+--- ceph-14.2.8/src/common/cohort_lru.h 2021-04-20 13:48:51.150000000 +0800
++++ ceph-14.2.8/src/common/cohort_lru.h 2021-04-20 14:07:43.670000000 +0800
+@@ -42,6 +42,8 @@ namespace cohort {
+    
+    typedef bi::link_mode<bi::safe_link> link_mode;
+
++   class ObjectFactory; // Forward declaration
++
+    class Object
+    {
+    private:
+@@ -70,7 +72,7 @@ namespace cohort {
+       
+       uint32_t get_refcnt() const { return lru_refcnt; }
+
+-      virtual bool reclaim() = 0;
++      virtual bool reclaim(const ObjectFactory* newobj_fac) = 0;
+
+       virtual ~Object() {}
+
+@@ -132,7 +134,7 @@ namespace cohort {
+        (!(o->lru_flags & FLAG_EVICTING)));
+       }
+
+-      Object* evict_block() {
++      Object* evict_block(const ObjectFactory* newobj_fac) {
+    uint32_t lane_ix = next_evict_lane();
+    for (int ix = 0; ix < n_lanes; ++ix,
+           lane_ix = next_evict_lane()) {
+@@ -144,7 +146,7 @@ namespace cohort {
+        ++(o->lru_refcnt);
+        o->lru_flags |= FLAG_EVICTING;
+        lane.lock.unlock();
+-       if (o->reclaim()) {
++       if (o->reclaim(newobj_fac)) {
+          lane.lock.lock();
+          --(o->lru_refcnt);
+          /* assertions that o state has not changed across
+@@ -236,7 +238,7 @@ namespace cohort {
+       Object* insert(ObjectFactory* fac, Edge edge, uint32_t& flags) {
+    /* use supplied functor to re-use an evicted object, or
+     * allocate a new one of the descendant type */
+-   Object* o = evict_block();
++   Object* o = evict_block(fac);
+    if (o) {
+      fac->recycle(o); /* recycle existing object */
+      flags |= FLAG_RECYCLE;
+@@ -425,6 +427,10 @@ namespace cohort {
+      lat.lock->unlock();
+    return v;
+       } /* find_latch */
++
++      bool is_same_partition(uint64_t lhs, uint64_t rhs) {
++        return ((lhs % n_part) == (rhs % n_part));
++      }
+
+       void insert_latched(T* v, Latch& lat, uint32_t flags) {
+    (void) lat.p->tr.insert_unique_commit(*v, lat.commit_data);
+diff -uprN ceph-14.2.8/src/common/legacy_config_opts.h ceph-14.2.8/src/common/legacy_config_opts.h 
+--- ceph-14.2.8/src/common/legacy_config_opts.h 2021-04-20 13:48:51.150000000 +0800
++++ ceph-14.2.8/src/common/legacy_config_opts.h 2021-04-20 14:08:22.110000000 +0800
+@@ -1276,6 +1276,7 @@ OPTION(rgw_max_attr_name_len, OPT_SIZE)
+ OPTION(rgw_max_attr_size, OPT_SIZE)
+ OPTION(rgw_max_attrs_num_in_req, OPT_U64)
+
++OPTION(rgw_obj_preftch_size, OPT_INT)
+ OPTION(rgw_max_chunk_size, OPT_INT)
+ OPTION(rgw_put_obj_min_window_size, OPT_INT)
+ OPTION(rgw_put_obj_max_window_size, OPT_INT)
+diff -uprN ceph-14.2.8/src/common/options.cc ceph-14.2.8/src/common/options.cc
+--- ceph-14.2.8/src/common/options.cc 2021-04-20 13:48:51.150000000 +0800
++++ ceph-14.2.8/src/common/options.cc 2021-04-20 14:08:22.110000000 +0800
+@@ -5616,6 +5616,10 @@ std::vector<Option> get_rgw_options() {
+     .set_default(false)
+     .set_description("true if LTTng-UST tracepoints should be enabled"),
+
++    Option("rgw_obj_prefetch_size", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
++    .set_default(4_M)
++    .set_description("Set RGW obj prefetch size"),
++
+     Option("rgw_max_chunk_size", Option::TYPE_SIZE, Option::LEVEL_ADVANCED)
+     .set_default(4_M)
+     .set_description("Set RGW max chunk size")
+diff -uprN ceph-14.2.8/src/global/signal_handler.cc ceph-14.2.8/src/global/signal_handler.cc
+--- ceph-14.2.8/src/global/signal_handler.cc 2021-04-20 13:48:51.210000000 +0800
++++ ceph-14.2.8/src/global/signal_handler.cc 2021-04-20 14:11:25.890000000 +0800
+@@ -329,6 +329,7 @@ static void handle_fatal_signal(int sign
+
+ void install_standard_sighandlers(void)
+{
++/*
+   install_sighandler(SIGSEGV, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);
+   install_sighandler(SIGABRT, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);
+   install_sighandler(SIGBUS, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);  
+@@ -336,7 +3367,8 @@ void install_standard_sighandlers(void)
+   install_sighandler(SIGFPE, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);
+   install_sighandler(SIGXCPU, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);
+   install_sighandler(SIGXFSZ, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);
+-  install_sighandler(SIGSYS, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);
++  install_sighandler(SIGSYS, handle_fatal_signal, SA_RESETHAND | SA_NODEFER);*/
++  ;
+}
+
+
+diff -uprN ceph-14.2.8/src/rgw/rgw_file.cc ceph-14.2.8/src/rgw/rgw_file.cc
+--- ceph-14.2.8/src/rgw/rgw_file.cc 2021-04-20 13:48:51.550000000 +0800
++++ ceph-14.2.8/src/rgw/rgw_file.cc 2021-04-20 14:35:25.370000000 +0800
+@@ -293,7 +293,7 @@ namesapce rgw {
+
+     int rc = rgwlib.get_fe()->execute_req(&req);
+     if ((rc == 0) &&
+-    (req.get_ret()) == 0)) {
++    ((rc = req.get_ret()) == 0)) {
+        lock_guard guard(rgw_fh->mtx);
+        rgw_fh->set_atime(real_clock::to_timespec(real_clock::now()));
+        *bytes_read = req.nread;
+@@ -316,7 +316,7 @@ namespace rgw {
+
+     int rc = rgwlib.get_fe()->execute_req(&req);
+     if ((rc == 0) &&
+-        (req.get_ret()) == 0)) {
++        ((rc = req.get_ret()) == 0)) {
+       lock_guard(rgw_fh->mtx);
+       rgw_fh->set_atime(real_clock::to_timespec(real_clock::now()));
+       *bytes_read = req.nread;
+@@ -1201,10 +1201,19 @@ namespace rgw {
+     return dar;
+   } /* RGWFileHandle::decode_attrs */
+
+-  bool RGWFileHandle::reclaim() {
++  bool RGWFileHandle::reclaim(const cohort::lru::ObjectFactory* newobj_fac) {
+     lsubdout(fs->get_context(), rgw 17)
+       << __func__ << " " << *this
+       << dend1;
++    auto factory == dynamic_cast<const RGWFileHandle::Factory*>(newobj_fac);
++    if (factory == nullptr) {
++      return false;
++    }
++    /* make sure the reclaiming object is the same partiton with newobject factory,
++     * then we can recycle the object, and replace with newobject */
++    if (!fs->fh_cache,is_same_partition(factory->fhk.fh_hk.object, fh.fh_hk.object)) {
++      return false;
++    }
+     /* in the non-delete case, handle may still be in handle table */
+     if (fh_hook.is_linked()) {
+       /* in this case, we are being called from a context which holds
+diff -uprN ceph-14.2.8/src/rgw/rgw_file.h ceph-14.2.8/src/rgw/rgw_file.h
+--- ceph-14.2.8/src/rgw/rgw_file.h 2021-04-20 13:48:51.550000000 +0800
++++ ceph-14.2.8/src/rgw/rgw_file.h 2021-04-20 14:17:24.140000000 +0800
+@@ -721,7 +721,7 @@ namespace rgw {
+
+     void invalidate();
+
+-    bool reclaim() override;
++    bool reclaim(const cohort::lru::ObjectFactory* newobj_fac) override;
+
+     typedef cohort::lru::LRU<std::mutex> FhLRU;
+
+diff -uprN ceph-14.2.8/src/rgw/rgw_rados.cc ceph-14.2.8/src/rgw/rgw_rados.cc
+--- ceph-14.2.8/src/rgw/rgw_rados.cc 2021-04-20 13:48:51.560000000 +0800
++++ ceph-14.2.8/src/rgw/rgw_rados.cc 2021-04-20 14:18:01.750000000 +0800
+@@ -7940,7 +7940,7 @@ int RGWRados::raw_obj_stat(rgw_raw_obj&
+     op.stat2(&size, &mtime_ts, NULL);
+   }
+   if (first_chunk) {
+-    op.read(0, cct->_conf->rgw_max_chunk_size, first_chunk, NULL);
++    op.read(0, cct->_conf->rgw_obj_prefetch_size, first_chunk, NULL);
+   }
+   bufferlist.outbl;
+   r = ref.ioctx.operate(ref.obj.oid, &op, &outbl);    

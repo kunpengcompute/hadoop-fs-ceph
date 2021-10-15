@@ -46,11 +46,7 @@ public class CephRgwOutputStream extends OutputStream {
     }
 
     @Override
-    public void write(int byteData) throws IOException {
-        byte[] buf = new byte[1];
-        buf[0] = (byte) byteData;
-        write(buf, 0, 1);
-    }
+    public void write(int byteData) throws IOException {}
 
     // Implementation of the librgw file writing function.
     @Override

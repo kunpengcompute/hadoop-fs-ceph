@@ -21,26 +21,32 @@
 package org.apache.hadoop.fs.cephrgw;
 
 import org.apache.hadoop.fs.FSInputStream;
-import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.Locale;
 
-class CephRgwInputStream extends FSInputStream {
-    private transient final LibRGWFH fhPtr;
-    private transient long position;
-    private transient final long fileSize;
-    private transient final CephRgwFileSystem fileSystem;
+/*
+* Input stream for librgw native call.
+*/
 
-    CephRgwInputStream(final CephRgwFileSystem fileSystem, final Path path) throws IOException {
+public class CephRgwInputStream extends FSInputStream {
+    private LibRGWFH fhPtr;
+    private long position = 0;
+    private final long fileSize;
+    private CephRgwFileSystem fileSystem;
+    private static final Logger LOGGER = LoggerFactory.getLogger(CephRgwInputStream.class);
+
+    public CephRgwInputStream(CephRgwFileSystem fileSystem, Path path) throws IOException {
         this.fileSystem = fileSystem;
-        this.fhPtr = fileSystem.getFileHandleByAbsPath(path, CephRgwFileSystem.LOOKUP_FLAG_FILE, true, true);
+        fhPtr = fileSystem.getFileHandleByAbsPath(path, CephRgwFileSystem.LOOKUP_FLAG_FILE, true, true);
         this.fileSize = fhPtr.getFileStatus().getLen();
     }
 
     @Override
-    public void seek(long pos) {
+    public void seek(long pos) throws IOException {
         this.position = pos;
         if (this.position > fileSize) {
             this.position = fileSize;
@@ -51,16 +57,16 @@ class CephRgwInputStream extends FSInputStream {
     }
 
     @Override
-    public long getPos() {
+    public long getPos() throws IOException {
         return position;
     }
 
-    public long getFileSize() {
+    long getFileSize() {
         return fileSize;
     }
 
     @Override
-    public boolean seekToNewSource(long targetPos) {
+    public boolean seekToNewSource(long targetPos) throws IOException {
         return false;
     }
 
@@ -88,12 +94,11 @@ class CephRgwInputStream extends FSInputStream {
         doClose();
     }
 
-    public void doClose() throws IOException {
+    void doClose() throws IOException {
         fhPtr.close();
         super.close();
     }
 
-    // Invoke the librgw function to read files.
     @Override
     public int read(long position, byte[] buffer, int offset, int length) throws IOException {
         if (position >= fileSize) {
@@ -101,16 +106,16 @@ class CephRgwInputStream extends FSInputStream {
         }
         try {
             int expectedReadLength = (int) Math.min(fileSize - position, length);
-            int ret = fileSystem.rgwRead(fileSystem.getRgwFsPtr(), fhPtr.getFhPtr(), position, expectedReadLength,
-                    buffer, offset);
+            int ret =
+                    fileSystem.rgwRead(
+                            fileSystem.getRgwFsPtr(), fhPtr.getFhPtr(), position, expectedReadLength, buffer, offset);
             if (ret > 0) {
-                FileSystem.Statistics fileStatistics = new FileSystem.Statistics(fileSystem.getCephRgwStatistics());
-                fileStatistics.incrementBytesRead(ret);
+                fileSystem.getCephRgwStatistics().incrementBytesRead(ret);
             }
             return ret;
         } catch (CephRgwException e) {
-            throw new IOException(String.format(Locale.ROOT, "read file from position:%d, length:%d failed.",
-                    position, length), e);
+            throw new IOException(
+                    String.format(Locale.ROOT, "read file from position:%d, length:%d failed.", position, length), e);
         }
     }
 }
