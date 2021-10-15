@@ -1,30 +1,21 @@
 /*
  * Copyright (c) Huawei Technologies Co., Ltd. 2020-2020. All rights reserved.
- *
- * Description: The core librgw Filesystem implementation.
- *
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
  */
+
 package org.apache.hadoop.fs.cephrgw;
 
+import com.amazonaws.auth.AWSCredentialsProvider;
 import org.apache.commons.io.FileExistsException;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.*;
 import org.apache.hadoop.fs.permission.FsPermission;
+
+import static org.apache.hadoop.fs.s3a.S3AUtils.createAWSCredentialProviderSet;
+
+import org.apache.hadoop.fs.s3a.AWSCredentialProviderList;
+import org.apache.hadoop.fs.s3a.S3AFileSystem;
+import org.apache.hadoop.fs.s3a.S3AUtils;
 import org.apache.hadoop.util.Progressable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,9 +27,8 @@ import java.nio.file.DirectoryNotEmptyException;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
-import java.util.Map;
 import java.util.Locale;
-import java.util.Iterator;
+import java.util.function.Function;
 
 /**
  * The core librgw Filesystem implementation.
@@ -47,59 +37,53 @@ import java.util.Iterator;
  * create one.
  * If cast to {@code CephRgwFileSystem}, extra methods and features may be accessed.
  * Consider those private and unstable.
+ *
  */
 public class CephRgwFileSystem extends FileSystem {
     /**
      * Scheme for this FileSystem.
      */
     public static final String SCHEME = "cephrgw";
-    /**
-     * Currently, the liibrgw does not have any permission control function.
-     * Therefore, the user name and user group in the Hadoop file system are replaced by root.
-     */
-    public static final String CONST_USER = "root";
-    public static final String CONST_GROUP = "root";
-    public static final int ERR_NOT_EXISTS = -2;
-    public static final int ERR_EXISTS = -17;
-    public static final int ERR_DIR_NOT_EMPTY = -39;
-    /**
-     * The 15th bit in the permission query result of the librgw indicates whether the file is a directory,
-     * that is, 0x4000.
-     */
-    public static final int FLAG_DIR = 0x4000;
-    public static final int LOOKUP_FLAG_NONE = 0;
-    public static final int LOOKUP_FLAG_CREATE = 1;
-    public static final int LOOKUP_FLAG_RCB = 2;
-    public static final int LOOKUP_FLAG_DIR = 4;
-    public static final int LOOKUP_FLAG_FILE = 8;
-    public static final byte[] EMPTY_BYTE_TMP = new byte[1];
-    static final Map<String, LibRGWFH> FH_CACHE_MAP = new LinkedHashMap<>();
+
+    static final String CONST_USER = "root";
+    static final String CONST_GROUP = "root";
+    static final int ERR_NOT_EXISTS = -2;
+    static final int ERR_EXISTS = -17;
+    static final int ERR_DIR_NOT_EMPTY = -39;
+    static final int FLAG_DIR = 0040000;
+    static final int LOOKUP_FLAG_NONE = 0;
+    static final int LOOKUP_FLAG_CREATE = 1;
+    static final int LOOKUP_FLAG_RCB = 2;
+    static final int LOOKUP_FLAG_DIR = 4;
+    static final int LOOKUP_FLAG_FILE = 8;
+    static final byte[] EMPTY_BYTE_TMP = new byte[1];
+    static final LinkedHashMap<String, LibRGWFH> FH_CACHE_MAP = new LinkedHashMap<>();
     private static final Logger LOGGER = LoggerFactory.getLogger(CephRgwFileSystem.class);
-    private transient long vBlockSize;
-    private transient boolean isReadonly;
-    private transient int maxCacheSize;
-    private transient int rgwBufferSize;
-    private transient long librgwFsPtr;
-    private transient LibRGWFH rootFH;
-    private transient URI rootBucketPath;
-    private transient Path rootDirectory;
+    private long virtualBlockSize;
+    private boolean ensureReadonly = false;
+    private int maxInputStreamCacheSize;
+    private int cephRgwBufferSize;
+    private long librgwFsPtr = 0;
+    private LibRGWFH rootFH;
+    private URI rootBucketPath;
+    private Path rootDirectory = null;
+    private S3AFileSystem s3aFileSystemTmp;
+    private AWSCredentialProviderList credentials;
 
     static {
         try {
             System.loadLibrary("rgw_jni");
             staticInit(AbstractFileHandlerReceiver.class);
         } catch (Exception t) {
-            LOGGER.error("", t);
-            throw new RuntimeException("Initialization failed.");
+            LOGGER.error("rgw init failed", t);
+            System.exit(1);
         }
     }
 
     /**
      * Initialize a FileSystem.
-     * <p>
      * Called after the new FileSystem instance is constructed, and before it
      * is ready for use.
-     * <p>
      * FileSystem implementations overriding this method MUST forward it to
      * their superclass, though the order in which it is done, and whether
      * to alter the configuration before the invocation are options of the
@@ -113,46 +97,52 @@ public class CephRgwFileSystem extends FileSystem {
      */
     @Override
     public void initialize(final URI name, final Configuration conf) throws IOException {
-        vBlockSize = conf.getLong("fs.ceph.rgw.virtual.blocksize", Long.MAX_VALUE);
-        isReadonly = conf.getBoolean("fs.ceph.rgw.ensure-readonly", false);
-
         URI internalName = name;
-        if (internalName == null) {
-            internalName = getDefaultUri(conf);
+        if(internalName == null){
+            throw new NullPointerException();
         }
         super.initialize(internalName, conf);
-        try {
-            rootBucketPath = new URI(internalName.getScheme(), internalName.getAuthority(), "", "");
-        } catch (URISyntaxException e) {
-            LOGGER.error("URISyntaxException:" + e);
-            throw new IllegalArgumentException("initialize failed,please check  the path");
+
+        s3aFileSystemTmp = new S3AFileSystem();
+        try{
+            s3aFileSystemTmp.initialize(reSetUriToS3A(internalName), conf);
+        } catch (URISyntaxException e){
         }
 
+        virtualBlockSize = conf.getLong("fs.ceph.rgw.virtual.blocksize", 32 * 1024 * 1024);
+        ensureReadonly = conf.getBoolean("fs.ceph.rgw.ensure-readonly", false);
+
+        try{
+            rootBucketPath = new URI(internalName.getScheme(), internalName.getAuthority(), "", "");
+        } catch (URISyntaxException e){
+        }
         setWorkingDirectory(new Path("/"));
-        // I/O buffer sizes 16MB
-        rgwBufferSize = conf.getInt("fs.ceph.rgw.io.buffer.size", 1024 * 1024 * 16);
-        maxCacheSize = conf.getInt("fs.ceph.rgw.max.inputstream.cache.size", 1024 * 64);
+        cephRgwBufferSize = conf.getInt("fs.ceph.rgw.io.buffer.size", 1024 * 1024 * 4);
+        maxInputStreamCacheSize = conf.getInt("fs.ceph.rgw.max.inputstream.cache.size", 1024 * 64);
+
+        String userId = conf.get("fs.ceph.rgw.userid", "");
+        credentials = createAWSCredentialProviderSet(name, conf);
+        String accessKey = credentials.getCredentials().getAWSAccessKeyId();
+        String secretKey = credentials.getCredentials().getAWSSecretKey();
         try {
-            String userId = conf.get("fs.ceph.rgw.userid", "");
-            String accessKey = conf.get("fs.ceph.rgw.access.key", "");
-            String secretKey = conf.get("fs.ceph.rgw.secret.key", "");
             librgwFsPtr = rgwMount(userId, accessKey, secretKey);
-            long currFh = rgwLookup(librgwFsPtr, getRootFH(librgwFsPtr), internalName.getAuthority(), 0, 0, LOOKUP_FLAG_DIR);
-            rgwGetattr(librgwFsPtr, currFh, new AbstractFileHandlerReceiver(this) {
-                @Override
-                void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus) {
-                    fileStatus.setPath(getWorkingDirectory());
-                    rootFH = new LibRGWFH(CephRgwFileSystem.this, currFh, fileStatus, false);
-                }
-            });
+            long currFh =
+                    rgwLookup(librgwFsPtr, getRootFH(librgwFsPtr), internalName.getAuthority(), 0, 0, LOOKUP_FLAG_DIR);
+            rgwGetattr(
+                    librgwFsPtr,
+                    currFh,
+                    new AbstractFileHandlerReceiver(this) {
+                        @Override
+                        void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus)
+                                throws IOException {
+                            fileStatus.setPath(getWorkingDirectory());
+                            rootFH = new LibRGWFH(CephRgwFileSystem.this, currFh, fileStatus, false);
+                        }
+                    });
+
         } catch (CephRgwException e) {
-            /*
-              If the initialization fails,the system invokes the shutdown operation to clear the remaining resources
-              and throws an exception.
-             */
             close();
-            LOGGER.error("IOException:Mount failed.", e);
-            throw new IOException("Mount failed.");
+            throw new IOException("Mount failed.", e);
         }
     }
 
@@ -170,28 +160,47 @@ public class CephRgwFileSystem extends FileSystem {
         return rootFH;
     }
 
+    /**
+     * get the RgwFsPtr
+     *  @return the rgw fs ptr
+     */
     public long getRgwFsPtr() {
         return librgwFsPtr;
     }
 
     public long getVirtualBlockSize() {
-        return vBlockSize;
+        return virtualBlockSize;
     }
 
+    /**
+     * get the CephRgw Statistics
+     *  @return CephRgw Statistics
+     */
     public Statistics getCephRgwStatistics() {
         return statistics;
     }
 
+    /**
+     * open the FSDataInputStream.
+     *
+     * @param path the data path
+     * @param bufferSize the open buffer size
+     * @return the FSDataInputStream
+     * @throws IOException IO failure
+     */
     @Override
     public FSDataInputStream open(final Path path, final int bufferSize) throws IOException {
         statistics.incrementReadOps(1);
         Path absPath = getAbsPath(path);
-        return doOpen(absPath);
+        if (isDirectory(path)){
+            throw new PathIsDirectoryException("Error:Path is directory.");
+        }
+        FSDataInputStream returnInputStream = doOpen(absPath, bufferSize);
+        return returnInputStream;
     }
 
     /**
-     * Create an FSDataOutputStream at the indicated Path with write-progress
-     * reporting.
+     * Create an FSDataOutputStream at the indicated Path with write-progress reporting
      *
      * @param path        the file name to create
      * @param permission  file permission
@@ -205,26 +214,31 @@ public class CephRgwFileSystem extends FileSystem {
      * @throws IOException IO failure
      */
     @Override
-    public FSDataOutputStream create(final Path path, final FsPermission permission, final boolean overwrite,
-                                     final int bufferSize, final short replication, final long blockSize,
-                                     final Progressable progress) throws IOException {
+    public FSDataOutputStream create(
+            final Path path,
+            final FsPermission permission,
+            final boolean overwrite,
+            final int bufferSize,
+            final short replication,
+            final long blockSize,
+            final Progressable progress)
+            throws IOException {
         Path absPath = getAbsPath(path);
         Path parent = absPath.getParent();
         if (parent != null) {
-            mkdirs(parent);
+            mkdirs(parent, permission);
         }
         return createNonRecursive(absPath, permission, overwrite, bufferSize, replication,
                 blockSize, progress);
     }
 
     /**
-     * Opens an FSDataOutputStream at the indicated Path with write-progress
-     * reporting. Same as create(), except fails if parent directory doesn't
-     * already exist.
+     * Opens an FSDataOutputStream at the indicated Path with write-progress reporting.
+     * Same as create(), except fails if parent directory doesn't already exist.
      *
      * @param newFilePath the file name to create
      * @param permission  file permission
-     * @param isCreated   {@link CreateFlag}s to use for this stream.
+     * @param flags   {@link CreateFlag}s to use for this stream.
      * @param bufferSize  the size of the buffer to be used.
      * @param replication required block replication for the file.
      * @param blockSize   block size
@@ -234,15 +248,29 @@ public class CephRgwFileSystem extends FileSystem {
      * @see #setPermission(Path, FsPermission)
      */
     @Override
-    public FSDataOutputStream createNonRecursive(final Path newFilePath, final FsPermission permission,
-                                                 final EnumSet<CreateFlag> isCreated, final int bufferSize, final short replication, final long blockSize,
-                                                 final Progressable progress) throws IOException {
+    public FSDataOutputStream createNonRecursive(
+            final Path newFilePath,
+            final FsPermission permission,
+            final EnumSet<CreateFlag> flags,
+            final int bufferSize,
+            final short replication,
+            final long blockSize,
+            final Progressable progress)
+            throws IOException {
         statistics.incrementWriteOps(1);
         Path absPath = getAbsPath(newFilePath);
         Path parent = absPath.getParent();
-        if (parent != null && !exists(parent)) {
-            LOGGER.error("FileNotFoundException:Parent path doesn't exist." + parent.toString());
-            throw new FileNotFoundException("Error:File doesn't exist.");
+        if(flags.contains(CreateFlag.OVERWRITE)){
+            if (parent != null && !exists(parent)) {
+                throw new FileNotFoundException("Error:File doesn't exist.");
+            }
+        }else {
+            if (parent != null && exists(absPath)) {
+                throw new FileAlreadyExistsException("Error:File already exist.");
+            }
+        }
+        if(isDirectory(absPath)){
+            throw new PathIsDirectoryException("Error:Path is Directory");
         }
         CephRgwOutputStream cos = new CephRgwOutputStream(this, absPath);
         boolean isException = false;
@@ -251,49 +279,39 @@ public class CephRgwFileSystem extends FileSystem {
         } catch (IOException e) {
             isException = true;
             LOGGER.error("createNonRecursive Exception for this CephRgwFileSystem " + this.getClass() + "Method:cos.write()");
-            throw new CephRgwException("createNonRecursive Exception for this CephRgwFileSystem.");
+            throw e;
         } finally {
             if (isException) {
                 cos.close();
             }
         }
-        return new FSDataOutputStream(new BufferedOutputStream(cos, rgwBufferSize), statistics);
+        return new FSDataOutputStream(new BufferedOutputStream(cos, cephRgwBufferSize), statistics);
+    }
+
+    /**
+     * reset the uri to s3a
+     *
+     * @param cephRgwUri the ceph rgw uri
+     * @return the s3a uri
+     * @throws URISyntaxException failure
+     */
+    public URI reSetUriToS3A(URI cephRgwUri) throws URISyntaxException {
+        String s3aString = "s3a" + ":" + cephRgwUri.toString().split(":")[1];
+        URI tmpUri = new URI(s3aString);
+        return tmpUri;
     }
 
     @Override
-    public FSDataOutputStream append(final Path path, final int bufferSize, final Progressable progress) {
+    public FSDataOutputStream append(final Path path, final int bufferSize, final Progressable progress)
+            throws UnsupportedOperationException{
         throw new UnsupportedOperationException("append Not implement yet.");
     }
 
-    /**
-     * Rename the file or directory denoted by the first abstract pathname to
-     * the second abstract pathname, returning <code>true</code> if and only if
-     * the operation succeeds.
-     */
     @Override
     public boolean rename(final Path src, final Path dst) throws IOException {
-        Path absPathDst = getAbsPath(dst);
-        if (exists(absPathDst)) {
-            LOGGER.error("File already exist:" + src.toString());
-            throw new FileExistsException("File already exist,please check the file path.");
-        }
-        Path absPathSrc = getAbsPath(src);
-        FileStatus srcStatus = getFileStatus(absPathSrc);
-        if (srcStatus.isDirectory()) {
-            LOGGER.error("IllegalArgumentException:path rename unsupported," + src);
-            throw new IllegalArgumentException("ERROR:path rename unsupported.");
-        }
-        return doRename(absPathSrc, absPathDst);
+        return s3aFileSystemTmp.rename(src, dst);
     }
 
-    /**
-     * Abstract class that implements the FileSystem class to delete files and directories.
-     *
-     * @param path      the file name to delete
-     * @param recursive Check whether the directory is empty.
-     * @return boolean
-     * @throws IOException IO Exception
-     */
     @Override
     public boolean delete(final Path path, final boolean recursive) throws IOException {
         Path absPath = getAbsPath(path);
@@ -311,7 +329,48 @@ public class CephRgwFileSystem extends FileSystem {
         }
     }
 
-    // Abstract class for implementing the FileSystem class to obtain subfiles in a directory.
+    /**
+     * getCanonicalServiceName because we don't support token in CephRgwFileSystem.
+     *
+     * @return a uri string
+     */
+    @Override
+    public String getCanonicalServiceName() {
+        return getUri().toString();
+    }
+
+    private  class ListStatusFileHandlerReceiver extends AbstractFileHandlerReceiver {
+        private Path absPath;
+        private LinkedList<FileStatus> ret;
+        private LibRGWFH fileHandle;
+
+        ListStatusFileHandlerReceiver(Path absPath, LinkedList<FileStatus> ret, LibRGWFH fileHandle) {
+            super(CephRgwFileSystem.this);
+            this.absPath = absPath;
+            this.ret = ret;
+            this.fileHandle = fileHandle;
+        }
+
+        @Override
+        void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus) {
+            if (fileStatus.getPath() == null) {
+                return;
+            }
+            fileStatus.setPath(new Path(absPath, fileStatus.getPath()));
+            ret.add(fileStatus);
+            if (!ensureReadonly) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * get the files status
+     *
+     * @param newFilePath the file path
+     * @return the files status under the path
+     * @throws IOException failure
+     */
     @Override
     public FileStatus[] listStatus(final Path newFilePath) throws IOException {
         FileStatus checkFileTypeFs = getFileStatus(newFilePath);
@@ -319,30 +378,11 @@ public class CephRgwFileSystem extends FileSystem {
             return new FileStatus[]{checkFileTypeFs};
         }
         Path absPath = getAbsPath(newFilePath);
-        LinkedList<FileStatus> fileStatusList = new LinkedList<>();
+        LinkedList<FileStatus> ret = new LinkedList<FileStatus>();
         try (LibRGWFH fileHandle = getFileHandleByAbsPath(absPath, LOOKUP_FLAG_NONE, true, false)) {
-            rgwReaddir(librgwFsPtr, fileHandle.getFhPtr(), new AbstractFileHandlerReceiver(this) {
-                @Override
-                void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus) {
-                    if (fileStatus.getPath() == null) {
-                        return;
-                    }
-                    fileStatus.setPath(new Path(absPath, fileStatus.getPath()));
-                    fileStatusList.add(fileStatus);
-                    if (isReadonly) {
-                        try {
-                            long subFileHandlePtr = rgwLookup(librgwFsPtr, fileHandle.getFhPtr(), name, statPtr, mask,
-                                    LOOKUP_FLAG_RCB | (fileStatus.isDirectory() ? LOOKUP_FLAG_DIR : LOOKUP_FLAG_FILE));
-                            putFhToCache(fileStatus.getPath(), new LibRGWFH(CephRgwFileSystem.this,
-                                    subFileHandlePtr, fileStatus, true));
-                        } catch (IOException e) {
-                            LOGGER.error("", e);
-                        }
-                    }
-                }
-            });
+            rgwReaddir(librgwFsPtr, fileHandle.getFhPtr(), new ListStatusFileHandlerReceiver(absPath, ret, fileHandle));
         }
-        return fileStatusList.toArray(new FileStatus[0]);
+        return ret.toArray(new FileStatus[ret.size()]);
     }
 
     @Override
@@ -355,15 +395,6 @@ public class CephRgwFileSystem extends FileSystem {
         return rootDirectory;
     }
 
-    /**
-     * Make the given file and all non-existent parents into
-     * directories. Has roughly the semantics of Unix @{code mkdir -p}.
-     * Existence of the directory hierarchy is not an error.
-     *
-     * @param path       path to create
-     * @param permission to apply to path
-     * @throws IOException IO failure
-     */
     @Override
     public boolean mkdirs(final Path path, final FsPermission permission) throws IOException {
         Path absPath = getAbsPath(path);
@@ -394,15 +425,16 @@ public class CephRgwFileSystem extends FileSystem {
                 }
             }
             LOGGER.error(String.format(Locale.ROOT, "Mkdir %s failed.", path), e);
-            throw new CephRgwException("Mkdir file failed.");
+            throw new IOException(String.format(Locale.ROOT, "Mkdir %s failed.", path),e);
         }
     }
 
     @Override
     public FileStatus getFileStatus(final Path path) throws IOException {
         Path absPath = getAbsPath(path);
-        try (LibRGWFH libRGWFH = getFileHandleByAbsPath(absPath, LOOKUP_FLAG_NONE, true, true)) {
-            return libRGWFH.getFileStatus();
+        try (LibRGWFH fh = getFileHandleByAbsPath(absPath, LOOKUP_FLAG_NONE, true, true)) {
+            FileStatus ret = fh.getFileStatus();
+            return ret;
         }
     }
 
@@ -413,132 +445,117 @@ public class CephRgwFileSystem extends FileSystem {
         }
         rgwUmount(librgwFsPtr);
         super.close();
+        S3AUtils.closeAutocloseables(LOGGER, credentials);
+        credentials = null;
     }
 
+    /**
+     * whether the mode is a directory
+     *
+     * @param mode the input param
+     * @return result of the mode
+     */
     public boolean isDir(final int mode) {
         return (mode & FLAG_DIR) != 0;
     }
 
-    private FSDataInputStream doOpen(final Path absPath) throws IOException {
-        CephRgwInputStream rgwInputStream = new CephRgwInputStream(this, absPath);
-        long fileSize = rgwInputStream.getFileSize();
+    private FSDataInputStream doOpen(final Path absPath, final int bufSize) throws IOException {
+        CephRgwInputStream in = new CephRgwInputStream(this, absPath);
+        long fileSize = in.getFileSize();
         if (fileSize <= 0) {
-            return new FSDataInputStream(rgwInputStream);
+            return new FSDataInputStream(in);
         }
         int maxIntFileSize = (int) Math.min(fileSize, Integer.MAX_VALUE);
-        int newBufferSize = Math.min(maxIntFileSize, rgwBufferSize);
-        LOGGER.debug("cephrgw read buffer size:{}.", newBufferSize);
-        return new FSDataInputStream(new BufferedFSInputStream(rgwInputStream, newBufferSize));
+        int newBufferSize = Math.min(maxIntFileSize, cephRgwBufferSize);
+        return new FSDataInputStream(new BufferedFSInputStream(in, newBufferSize));
     }
 
-    public LibRGWFH getFileHandleByAbsPath(final Path path, final int flag, final boolean isCache,
-                                           final boolean isLoadListStatus) throws IOException {
+    /**
+     * get the file handler by the abs path
+     *
+     * @param path the input param
+     * @param flag the file operate mode
+     * @param isCache is cache field handler
+     * @param isLoadListStatus whether get the all the files handlers status
+     * @return LibRGWfile handler
+     * @throws IOException failure
+     */
+    public LibRGWFH getFileHandleByAbsPath(
+            final Path path, final int flag, final boolean isCache, final boolean isLoadListStatus) throws IOException {
+        boolean internalIsCache = isCache && ensureReadonly;
         if (path.isRoot()) {
             return rootFH;
         }
+        try {
+            return getLibRGWFHDirect(path, flag, internalIsCache);
+        } catch (CephRgwException e) {
+            if (e.getErrcode() == ERR_NOT_EXISTS) {
+                throw new FileNotFoundException(path.toString());
+            }
+            throw new IOException("Find path " + path.toString() + " failed.", e);
+        }
+    }
+
+    private LibRGWFH getLibRGWFHDirect(final Path path, int flag, boolean cache) throws CephRgwException, IOException {
         String pathName = getCephPathStr(path).substring(1);
-        boolean internalIsCache = isCache && isReadonly;
-        // Obtaining Handles When the Handle Cache Is Enabled.
-        if (internalIsCache) {
-            LibRGWFH rgwfh;
-            synchronized (FH_CACHE_MAP) {
-                rgwfh = FH_CACHE_MAP.remove(path.toString());
-            }
-            if (rgwfh != null) {
-                rgwfh.ref();
-            } else {
-                if (isLoadListStatus) {
-                    listStatus(path.getParent());
-                    return getFileHandleByAbsPath(path, flag, internalIsCache, false);
-                }
-                rgwfh = getRgwFh(path, pathName, internalIsCache, flag);
-            }
-            putFhToCache(path, rgwfh);
-            return rgwfh;
-        }
-        return getRgwFh(path, pathName, internalIsCache, flag);
-    }
-
-    // Invokes the librgw interface to obtain handles.
-    public LibRGWFH getRgwFh(Path path, String pathName, boolean internalIsCache, int flag) throws IOException {
-	try {
-        LibRGWFH[] libRgwFh = new LibRGWFH[1];
-        long fhPtr = rgwLookup(librgwFsPtr, rootFH.getFhPtr(), pathName, 0, 0, flag);
-        rgwGetattr(librgwFsPtr, fhPtr, new AbstractFileHandlerReceiver(this) {
-            @Override
-            void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus) {
-                fileStatus.setPath(path);
-                libRgwFh[0] = new LibRGWFH(CephRgwFileSystem.this, fhPtr, fileStatus, internalIsCache);
-            }
-        });
-        return libRgwFh[0];
-	} catch (CephRgwException e) {
-	    if (e.getErrcode() == ERR_NOT_EXISTS) {
-		LOGGER.error("FileNotFoundException" + path.toString());
-		throw new FileNotFoundException("ERROR:File not found.");
-	    }
-	    throw e;
-	}
-    }
-
-    private void putFhToCache(final Path path, final LibRGWFH fhs) {
-        synchronized (FH_CACHE_MAP) {
-            if (FH_CACHE_MAP.size() >= maxCacheSize) {
-                Iterator<String> iterator = FH_CACHE_MAP.keySet().iterator();
-                String minFinishTimePath = iterator.next();
-                if (minFinishTimePath != null) {
-                    LibRGWFH removeFH = FH_CACHE_MAP.remove(minFinishTimePath);
-                    if (removeFH != null) {
-                        removeFH.close();
+        LibRGWFH[] ret = new LibRGWFH[1];
+        long fh = rgwLookup(librgwFsPtr, rootFH.getFhPtr(), pathName, 0, 0, flag);
+        rgwGetattr(
+                librgwFsPtr,
+                fh,
+                new AbstractFileHandlerReceiver(this) {
+                    @Override
+                    void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus)
+                            throws IOException {
+                        fileStatus.setPath(path);
+                        ret[0] = new LibRGWFH(CephRgwFileSystem.this, fh, fileStatus, cache);
                     }
-                }
-            }
-            FH_CACHE_MAP.put(path.toString(), fhs);
-        }
+                });
+        return ret[0];
     }
 
-    private boolean doRename(final Path src, final Path dst) throws IOException {
-        try (InputStream srcIn = open(src);
-             OutputStream dstOut = create(dst, false)) {
-            IOUtils.copy(srcIn, dstOut);
+    private class DoDeleteFileHandlerReceiver extends AbstractFileHandlerReceiver{
+        private Path path;
+        private boolean recursive;
+        private LibRGWFH fileHandle;
 
+        DoDeleteFileHandlerReceiver(Path path, boolean recursive, LibRGWFH fileHandle) {
+            super(CephRgwFileSystem.this);
+            this.path = path;
+            this.recursive = recursive;
+            this.fileHandle = fileHandle;
         }
-        return delete(src, false);
+
+        @Override
+        void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus) throws IOException {
+            if (!recursive) {
+                throw new PathIsNotEmptyDirectoryException(path.toString());
+            }
+            if (fileStatus.getPath() == null) {
+                return;
+            }
+            fileStatus.setPath(new Path(path, fileStatus.getPath()));
+            try{
+                doDelete(fileStatus.getPath(), fileHandle, true);
+            } catch (FileNotFoundException e) {
+                LOGGER.debug("");
+            }
+        }
     }
 
     private void doDelete(final Path path, final LibRGWFH parentFh, final boolean recursive) throws IOException {
         try (LibRGWFH fileHandle = getFileHandleByAbsPath(path, LOOKUP_FLAG_NONE, false, false)) {
-            rgwReaddir(librgwFsPtr, fileHandle.getFhPtr(), new AbstractFileHandlerReceiver(this) {
-                @Override
-                void receiveFileHandler(String name, long statPtr, int mask, FileStatus fileStatus)
-                        throws IOException {
-                    if (!recursive) {
-                        LOGGER.error("path is not empty Directory: " + path.toString());
-                        throw new PathIsNotEmptyDirectoryException("path is not empty Directory.");
-                    }
-                    if (fileStatus.getPath() == null) {
-                        return;
-                    }
-                    fileStatus.setPath(new Path(path, fileStatus.getPath()));
-                    try {
-                        doDelete(fileStatus.getPath(), fileHandle, true);
-                    } catch (FileNotFoundException e) {
-                        LOGGER.error("FileNotFoundException:" + e);
-                    }
-                }
-            });
+            AbstractFileHandlerReceiver recver = new DoDeleteFileHandlerReceiver(path, recursive, fileHandle);
+            rgwReaddir(librgwFsPtr, fileHandle.getFhPtr(), recver);
             rgwUnlink(librgwFsPtr, parentFh.getFhPtr(), path.getName());
         } catch (CephRgwException e) {
             if (e.getErrcode() == ERR_NOT_EXISTS) {
-                LOGGER.error("FileNotFoundException" + path.toString());
-                throw new FileNotFoundException("ERROR:File not found.");
+                throw new FileNotFoundException(path.toString());
             }
             if (e.getErrcode() == ERR_DIR_NOT_EMPTY) {
-                LOGGER.error("DirectoryNotEmptyException" + path.toUri().getPath());
-                throw new DirectoryNotEmptyException("path is not empty Directory.");
+                throw new DirectoryNotEmptyException(path.toUri().getPath());
             }
-            LOGGER.error(String.format(Locale.ROOT, "delete path %s failed.", path), e);
-            throw new CephRgwException("Delete file failed.");
+            throw new IOException(String.format(Locale.ROOT, "delete path %s failed.", path), e);
         }
     }
 
@@ -564,41 +581,179 @@ public class CephRgwFileSystem extends FileSystem {
         return pathStr.replaceAll("/+", "/");
     }
 
-    private static native void staticInit(Class<AbstractFileHandlerReceiver> fileHandlerReceiver) throws CephRgwException;
+    private static native void staticInit(Class<AbstractFileHandlerReceiver> fileHandlerReceiver)
+            throws CephRgwException;
 
-    public native void rgwUmount(final long rgwFsPtr);
+    /**
+     * umount rgw
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     */
+    public native void rgwUmount(long rgwFsPtr);
 
+    /**
+     * rgw read the data
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param fileHandlePtr the rgw file handle ptr
+     * @param position position of file
+     * @param length expected read length
+     * @param buffer buffer to receive data
+     * @param offset start location in buffer
+     * @return the read result
+     * @throws CephRgwException failure
+     */
     public native int rgwRead(long rgwFsPtr, long fileHandlePtr, long position, int length, byte[] buffer, int offset)
             throws CephRgwException;
 
+    /**
+     * rgw write the data
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param fileHandlePtr the rgw file handle ptr
+     * @param position position of file
+     * @param length expected write length
+     * @param buffer data buffer to write
+     * @param offset start location in buffer
+     * @throws CephRgwException failure
+     */
     public native void rgwWrite(long rgwFsPtr, long fileHandlePtr, long position, int length, byte[] buffer, int offset)
             throws CephRgwException;
 
+    /**
+     * create rgw file system
+     *
+     * @param userId the user id
+     * @param accessKey access key same as s3
+     * @param secretKey secret key same as s3
+     * @return the rgw file system pointer
+     * @throws CephRgwException failure
+     */
     public native long rgwMount(String userId, String accessKey, String secretKey) throws CephRgwException;
 
+    /**
+     * open a file from file handle.
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param fileHandlePtr the rgw file handle ptr
+     * @throws CephRgwException failure
+     */
     public native void rgwOpen(long rgwFsPtr, long fileHandlePtr) throws CephRgwException;
 
+    /**
+     * close a file handle
+     *
+     * @param rgwFsPtr
+     * @param fileHandlePtr
+     */
     public native void rgwClose(long rgwFsPtr, long fileHandlePtr);
 
+    /**
+     * find file by parent file handle and file name
+     *
+     * @param fsrgwFsPtr the rgw filesystem ptr
+     * @param parentFh the parent file handle
+     * @param pathName selected file name
+     * @param statPtr stat ptr for receive rgw handle
+     * @param mask mask for handle
+     * @param flag lookup flag
+     * @return the rgw file handle ptr
+     * @throws CephRgwException failure
+     */
     public native long rgwLookup(long fsrgwFsPtr, long parentFh, String pathName, long statPtr, int mask, int flag)
             throws CephRgwException;
 
+    /**
+     * get root file handle from rgw file system
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @return the root file handle from rgw file system
+     */
     public native long getRootFH(long rgwFsPtr);
 
+    /**
+     * rgw rename the file
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param srcFh the source file handle ptr
+     * @param srcName the source file name
+     * @param dstFh the destination file handler ptr
+     * @param dstName the destination file name
+     * @throws CephRgwException failure
+     */
+    public native void rgwRename(long rgwFsPtr, long srcFh, String srcName, long dstFh, String dstName)
+        throws CephRgwException;
+
+    /**
+     * delete the file
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param fileHandlePtr file handle ptr for the parent path od deleted file
+     * @param name deleted file name
+     * @throws CephRgwException failure
+     */
     public native void rgwUnlink(long rgwFsPtr, long fileHandlePtr, String name) throws CephRgwException;
 
+    /**
+     * rgw get the attributes
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param fileHandlePtr the file handler ptr
+     * @param receiver the AbstractFileHandlerReceiver
+     * @throws CephRgwException failure
+     */
     public native void rgwGetattr(long rgwFsPtr, long fileHandlePtr, AbstractFileHandlerReceiver receiver) throws CephRgwException;
 
+    /**
+     * rgw read the file folder
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param fileHandlePtr the file handler ptr
+     * @param receiver the AbstractFileHandlerReceiver
+     */
     public native void rgwReaddir(long rgwFsPtr, long fileHandlePtr, AbstractFileHandlerReceiver receiver);
 
+    /**
+     * rgw create folder
+     *
+     * @param rgwFsPtr the rgw filesystem ptr
+     * @param fileHandlePtr the file handler ptr
+     * @param name the file name
+     * @param mode the input param
+     * @throws CephRgwException failure
+     */
     public native void rgwMkdir(long rgwFsPtr, long fileHandlePtr, String name, int mode) throws CephRgwException;
 
+    /**
+     * get the Length
+     *
+     * @param statPtr stat ptr for receive rgw handle
+     * @return the length
+     */
     public native long getLength(long statPtr);
 
+    /**
+     * get the AccessTime
+     *
+     * @param statPtr stat ptr for receive rgw handle
+     * @return the access time
+     */
     public native long getAccessTime(long statPtr);
 
+    /**
+     * get the ModifyTime
+     *
+     * @param statPtr stat ptr for receive rgw handle
+     * @return the modify time
+     */
     public native long getModifyTime(long statPtr);
 
+    /**
+     * get the mode
+     *
+     * @param statPtr stat ptr for receive rgw handle
+     * @return the mode of the statPtr
+     */
     public native int getMode(long statPtr);
 }
 

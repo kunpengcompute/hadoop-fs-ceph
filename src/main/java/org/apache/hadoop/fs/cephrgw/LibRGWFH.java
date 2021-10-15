@@ -26,14 +26,14 @@ import java.io.Closeable;
 import java.io.IOException;
 
 /**
- * librgw句柄对应的java类
+ * File handle class for librgw.
  */
 class LibRGWFH implements Closeable {
-    private transient final CephRgwFileSystem fileSystem;
-    private transient long fhPtrLong;
-    private transient final FileStatus fileStatus;
-    private transient int refNum = 1;
-    private transient final boolean cache;
+    private final CephRgwFileSystem fileSystem;
+    private long fhPtrLong;
+    private FileStatus fileStatus;
+    private int refNum = 1;
+    private boolean cache;
 
     LibRGWFH(CephRgwFileSystem fileSystem, long fhPtr, FileStatus fileStatus, boolean cache) {
         this.fileSystem = fileSystem;
@@ -42,57 +42,44 @@ class LibRGWFH implements Closeable {
         this.cache = cache;
     }
 
-    // Closing a file handle.
     @Override
-    public void close() {
-        // The handle of the file root directory cannot be directly closed here.
-        if (this != fileSystem.getRootFH()) {
-            if (!cache) {
-                doClose();
-                return;
-            }
-            /* When the cache is enabled, each thread may share a handle.
-             * Therefore, the number of references should be set to -1.
-             */
-            synchronized (this) {
-                refNum--;
-            }
-            // Close the handle completely when the number of references decreases to 0.
-            if (refNum == 0) {
-                synchronized (CephRgwFileSystem.FH_CACHE_MAP) {
-                    if (!CephRgwFileSystem.FH_CACHE_MAP.containsKey(fileStatus.getPath().toString())) {
-                        doClose();
-                    }
+    public synchronized void close() {
+        if (this == fileSystem.getRootFH()) {
+            return;
+        }
+        if (!cache) {
+            doClose();
+            return;
+        }
+        refNum--;
+        if (refNum == 0) {
+            synchronized (CephRgwFileSystem.FH_CACHE_MAP) {
+                if (!CephRgwFileSystem.FH_CACHE_MAP.containsKey(fileStatus.getPath().toString())) {
+                    doClose();
                 }
             }
         }
+
     }
 
-    // If a thread references this handle, the referrer increases by 1.
-    void ref() {
-        synchronized (this) {
-            refNum++;
-        }
+    synchronized void ref() {
+        refNum++;
     }
 
-    // Operation for closing a handle
     void doClose() {
         fileSystem.rgwClose(fileSystem.getRgwFsPtr(), fhPtrLong);
         fhPtrLong = 0;
     }
 
-    // Obtains the FileStatus information corresponding to the handle.
-    FileStatus getFileStatus() {
+    FileStatus getFileStatus() throws IOException {
         return fileStatus;
     }
 
-    // Obtains the C language pointer of the handle.
     long getFhPtr() throws IOException {
         checkClosed();
         return fhPtrLong;
     }
 
-    // Check whether the handle is closed.
     private void checkClosed() throws IOException {
         if (fhPtrLong == 0) {
             throw new IOException("File handler is closed.");
