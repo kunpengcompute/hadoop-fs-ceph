@@ -16,7 +16,7 @@ Building
 
     mvn package -DskipTests
 
-(3) Get "hdfs-ceph-3.1.1.jar" from the "hadoop-fs-ceph/target/" folder.
+(3) Get "hdfs-ceph-3.2.0.jar" from the "hadoop-fs-ceph/target/" folder.
 
 (4) Get "librgw_jni.so" from the "hadoop-fs-ceph/target/" folder.
 
