@@ -32,5 +32,5 @@ and other information, see
 
 or the repository at
 
-  https://github.com/apache/hadoop/tree/release-3.1.1-RC0
+  https://github.com/apache/hadoop/tree/release-3.2.0-RC0
 
